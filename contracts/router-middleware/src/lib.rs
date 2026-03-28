@@ -22,6 +22,7 @@ pub enum DataKey {
     RouteConfig(String),        // route_name -> RouteConfig
     GlobalEnabled,
     TotalCalls,
+    CircuitBreaker(String),     // route_name -> CircuitBreakerState
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -44,6 +45,21 @@ pub struct RouteConfig {
     pub window_seconds: u64,
     /// Whether this route is enabled
     pub enabled: bool,
+    /// Circuit breaker failure threshold (0 = disabled)
+    pub failure_threshold: u32,
+    /// Circuit breaker recovery window in seconds
+    pub recovery_window_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitBreakerState {
+    /// Number of consecutive failures
+    pub failure_count: u32,
+    /// Timestamp when circuit was opened
+    pub opened_at: u64,
+    /// Whether circuit is currently open
+    pub is_open: bool,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -58,6 +74,7 @@ pub enum MiddlewareError {
     RouteDisabled = 5,
     MiddlewareDisabled = 6,
     InvalidConfig = 7,
+    CircuitOpen = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -104,6 +121,8 @@ impl RouterMiddleware {
     /// * `max_calls_per_window` - Maximum allowed calls per time window (0 = unlimited).
     /// * `window_seconds` - Duration of the rate-limit window in seconds.
     /// * `enabled` - Whether this route should be enabled.
+    /// * `failure_threshold` - Circuit breaker failure threshold (0 = disabled).
+    /// * `recovery_window_seconds` - Circuit breaker recovery window in seconds.
     ///
     /// # Returns
     /// `Ok(())` on success.
@@ -119,6 +138,8 @@ impl RouterMiddleware {
         max_calls_per_window: u32,
         window_seconds: u64,
         enabled: bool,
+        failure_threshold: u32,
+        recovery_window_seconds: u64,
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
@@ -131,6 +152,8 @@ impl RouterMiddleware {
             max_calls_per_window,
             window_seconds,
             enabled,
+            failure_threshold,
+            recovery_window_seconds,
         };
         env.storage().instance().set(&DataKey::RouteConfig(route), &config);
         Ok(())
@@ -155,6 +178,7 @@ impl RouterMiddleware {
     /// * [`MiddlewareError::MiddlewareDisabled`] — if middleware is globally disabled.
     /// * [`MiddlewareError::RouteDisabled`] — if the specific route is disabled.
     /// * [`MiddlewareError::RateLimitExceeded`] — if `caller` has exceeded the rate limit for `route`.
+    /// * [`MiddlewareError::CircuitOpen`] — if the circuit breaker is open for the route.
     pub fn pre_call(
         env: Env,
         caller: Address,
@@ -180,6 +204,27 @@ impl RouterMiddleware {
                 return Err(MiddlewareError::RouteDisabled);
             }
 
+            // Check circuit breaker
+            if config.failure_threshold > 0 {
+                let cb_state: CircuitBreakerState = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CircuitBreaker(route.clone()))
+                    .unwrap_or(CircuitBreakerState {
+                        failure_count: 0,
+                        opened_at: 0,
+                        is_open: false,
+                    });
+
+                if cb_state.is_open {
+                    let now = env.ledger().timestamp();
+                    let recovery_elapsed = now >= cb_state.opened_at + config.recovery_window_seconds;
+                    if !recovery_elapsed {
+                        return Err(MiddlewareError::CircuitOpen);
+                    }
+                }
+            }
+
             // Check rate limit
             if config.max_calls_per_window > 0 {
                 let now = env.ledger().timestamp();
@@ -192,9 +237,10 @@ impl RouterMiddleware {
                         window_start: now,
                     });
 
-                let in_window = now < state.window_start + config.window_seconds;
-                let calls = if in_window { state.calls_in_window } else { 0 };
-                let window_start = if in_window { state.window_start } else { now };
+                // Check if window has elapsed
+                let window_elapsed = now >= state.window_start + config.window_seconds;
+                let calls = if window_elapsed { 0 } else { state.calls_in_window };
+                let window_start = if window_elapsed { now } else { state.window_start };
 
                 if calls >= config.max_calls_per_window {
                     return Err(MiddlewareError::RateLimitExceeded);
@@ -227,10 +273,12 @@ impl RouterMiddleware {
         Ok(())
     }
 
-    /// Post-call hook: emits a success or failure event.
+    /// Post-call hook: tracks failures and manages circuit breaker.
     ///
     /// Should be called after a routed contract call completes. Emits a
-    /// `post_call` event with the caller, route name, and outcome.
+    /// `post_call` event with the caller, route name, and outcome. If the call
+    /// failed and the route has a circuit breaker configured, increments the
+    /// failure count and trips the circuit if the threshold is reached.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -242,6 +290,41 @@ impl RouterMiddleware {
             (Symbol::new(&env, "post_call"),),
             (caller.clone(), route.clone(), success),
         );
+
+        if !success {
+            if let Some(config) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
+            {
+                if config.failure_threshold > 0 {
+                    let mut cb_state: CircuitBreakerState = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::CircuitBreaker(route.clone()))
+                        .unwrap_or(CircuitBreakerState {
+                            failure_count: 0,
+                            opened_at: 0,
+                            is_open: false,
+                        });
+
+                    cb_state.failure_count += 1;
+
+                    if cb_state.failure_count >= config.failure_threshold {
+                        cb_state.is_open = true;
+                        cb_state.opened_at = env.ledger().timestamp();
+                        env.events().publish(
+                            (Symbol::new(&env, "circuit_opened"),),
+                            (route.clone(), cb_state.failure_count),
+                        );
+                    }
+
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::CircuitBreaker(route), &cb_state);
+                }
+            }
+        }
     }
 
     /// Enable or disable all middleware globally.
@@ -335,6 +418,41 @@ impl RouterMiddleware {
             .ok_or(MiddlewareError::NotInitialized)
     }
 
+    /// Reset circuit breaker for a route.
+    ///
+    /// Manually resets the circuit breaker state for a route, clearing the
+    /// failure count and closing the circuit. Caller must be the admin.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `caller` - The address initiating the call; must be the admin.
+    /// * `route` - The route name whose circuit breaker should be reset.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// * [`MiddlewareError::Unauthorized`] — if `caller` is not the admin.
+    /// * [`MiddlewareError::NotInitialized`] — if the contract has not been initialized.
+    pub fn reset_circuit_breaker(
+        env: Env,
+        caller: Address,
+        route: String,
+    ) -> Result<(), MiddlewareError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        let reset_state = CircuitBreakerState {
+            failure_count: 0,
+            opened_at: 0,
+            is_open: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreaker(route), &reset_state);
+        Ok(())
+    }
+
     /// Transfer admin to a new address.
     ///
     /// Replaces the current admin with `new_admin`. The `current` address must
@@ -406,7 +524,7 @@ mod tests {
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
         // max 2 calls per 60s window
-        client.configure_route(&admin, &route, &2, &60, &true);
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0);
 
         let caller = Address::generate(&env);
         client.pre_call(&caller, &route);
@@ -419,7 +537,7 @@ mod tests {
     fn test_rate_limit_resets_after_window() {
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
-        client.configure_route(&admin, &route, &1, &60, &true);
+        client.configure_route(&admin, &route, &1, &60, &true, &0, &0);
 
         let caller = Address::generate(&env);
         client.pre_call(&caller, &route);
@@ -433,7 +551,7 @@ mod tests {
     fn test_disabled_route_blocked() {
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
-        client.configure_route(&admin, &route, &0, &0, &false);
+        client.configure_route(&admin, &route, &0, &0, &false, &0, &0);
         let caller = Address::generate(&env);
         let result = client.try_pre_call(&caller, &route);
         assert_eq!(result, Err(Ok(MiddlewareError::RouteDisabled)));
@@ -454,7 +572,7 @@ mod tests {
         let (env, _admin, client) = setup();
         let attacker = Address::generate(&env);
         let route = String::from_str(&env, "oracle/get_price");
-        let result = client.try_configure_route(&attacker, &route, &10, &60, &true);
+        let result = client.try_configure_route(&attacker, &route, &10, &60, &true, &0, &0);
         assert_eq!(result, Err(Ok(MiddlewareError::Unauthorized)));
     }
 
@@ -475,8 +593,8 @@ mod tests {
         let route_a = String::from_str(&env, "oracle/price");
         let route_b = String::from_str(&env, "vault/deposit");
         // route_a: 10 calls per minute, route_b: 5 calls per minute
-        client.configure_route(&admin, &route_a, &10, &60, &true);
-        client.configure_route(&admin, &route_b, &5, &60, &true);
+        client.configure_route(&admin, &route_a, &10, &60, &true, &0, &0);
+        client.configure_route(&admin, &route_b, &5, &60, &true, &0, &0);
 
         let caller = Address::generate(&env);
         // Make 4 calls on route_a — drains route_a counter to 4
@@ -543,13 +661,13 @@ mod tests {
 
         // old admin should no longer be able to configure routes
         let route = String::from_str(&env, "oracle/get_price");
-        let result = client.try_configure_route(&admin, &route, &10, &60, &true);
+        let result = client.try_configure_route(&admin, &route, &10, &60, &true, &0, &0);
         assert_eq!(result, Err(Ok(MiddlewareError::Unauthorized)));
 
         // new admin should be able to configure routes
         assert!(
             client
-                .try_configure_route(&new_admin, &route, &10, &60, &true)
+                .try_configure_route(&new_admin, &route, &10, &60, &true, &0, &0)
                 .is_ok()
         );
     }
