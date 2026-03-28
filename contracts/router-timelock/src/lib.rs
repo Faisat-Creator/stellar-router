@@ -21,6 +21,7 @@ pub enum DataKey {
     MinDelay,
     Operation(u64),   // op_id -> TimelockOp
     NextOpId,
+    OperationDeps(u64), // op_id -> Vec<u64> (dependencies)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ pub enum TimelockError {
     AlreadyExecuted = 6,
     AlreadyCancelled = 7,
     InvalidDelay = 8,
+    DependencyNotMet = 9,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -104,6 +106,7 @@ impl RouterTimelock {
     /// * `target` - The contract address that will be affected by the change.
     /// * `delay` - Number of seconds to wait before the operation can execute.
     ///   Must be >= the configured `min_delay`.
+    /// * `depends_on` - Optional vector of operation IDs that must complete before this one.
     ///
     /// # Returns
     /// The `u64` operation ID assigned to the new operation.
@@ -118,6 +121,7 @@ impl RouterTimelock {
         description: String,
         target: Address,
         delay: u64,
+        depends_on: soroban_sdk::Vec<u64>,
     ) -> Result<u64, TimelockError> {
         proposer.require_auth();
         Self::require_admin(&env, &proposer)?;
@@ -151,6 +155,11 @@ impl RouterTimelock {
         };
 
         env.storage().instance().set(&DataKey::Operation(op_id), &op);
+        if !depends_on.is_empty() {
+            env.storage()
+                .instance()
+                .set(&DataKey::OperationDeps(op_id), &depends_on);
+        }
         env.storage().instance().set(&DataKey::NextOpId, &(op_id + 1));
 
         env.events().publish(
@@ -165,7 +174,8 @@ impl RouterTimelock {
     ///
     /// Marks the operation as executed. The current ledger timestamp must be
     /// >= the operation's ETA. The operation must not have been previously
-    /// executed or cancelled. Caller must be the admin.
+    /// executed or cancelled. All dependencies must have been executed.
+    /// Caller must be the admin.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -181,6 +191,7 @@ impl RouterTimelock {
     /// * [`TimelockError::AlreadyExecuted`] — if the operation has already been executed.
     /// * [`TimelockError::AlreadyCancelled`] — if the operation has been cancelled.
     /// * [`TimelockError::TooEarly`] — if the current timestamp is before the operation's ETA.
+    /// * [`TimelockError::DependencyNotMet`] — if any dependency has not been executed.
     pub fn execute(env: Env, caller: Address, op_id: u64) -> Result<(), TimelockError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
@@ -201,6 +212,24 @@ impl RouterTimelock {
             return Err(TimelockError::TooEarly);
         }
 
+        // Check dependencies
+        if let Some(deps) = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Vec<u64>>(&DataKey::OperationDeps(op_id))
+        {
+            for dep_id in deps.iter() {
+                let dep_op: TimelockOp = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Operation(dep_id))
+                    .ok_or(TimelockError::NotFound)?;
+                if !dep_op.executed {
+                    return Err(TimelockError::DependencyNotMet);
+                }
+            }
+        }
+
         op.executed = true;
         env.storage().instance().set(&DataKey::Operation(op_id), &op);
 
@@ -216,7 +245,9 @@ impl RouterTimelock {
     ///
     /// Marks the operation as cancelled, preventing future execution. The
     /// operation must not have been previously executed or cancelled. Caller
-    /// must be the admin.
+    /// must be the admin. Dependencies are cleared but can be cancelled
+    /// independently. The operation's state is fully cleared to prevent
+    /// re-execution if re-queued.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -250,6 +281,8 @@ impl RouterTimelock {
 
         op.cancelled = true;
         env.storage().instance().set(&DataKey::Operation(op_id), &op);
+        // Clear dependencies when cancelling
+        env.storage().instance().remove(&DataKey::OperationDeps(op_id));
 
         env.events().publish(
             (Symbol::new(&env, "op_cancelled"),),
@@ -439,7 +472,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         let result = client.try_execute(&admin, &op_id);
         assert!(result.is_ok());
@@ -452,7 +486,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         let result = client.try_execute(&admin, &op_id);
         assert_eq!(result, Err(Ok(TimelockError::TooEarly)));
     }
@@ -462,7 +497,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         client.cancel(&admin, &op_id);
         let op = client.get_op(&op_id).unwrap();
         assert!(op.cancelled);
@@ -473,7 +509,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         client.cancel(&admin, &op_id);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         let result = client.try_execute(&admin, &op_id);
@@ -485,7 +522,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
         let result = client.try_execute(&admin, &op_id);
@@ -497,7 +535,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let result = client.try_queue(&admin, &desc, &target, &100);
+        let deps = soroban_sdk::Vec::new(&env);
+        let result = client.try_queue(&admin, &desc, &target, &100, &deps);
         assert_eq!(result, Err(Ok(TimelockError::InvalidDelay)));
     }
 
@@ -507,7 +546,8 @@ mod tests {
         let attacker = Address::generate(&env);
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "malicious");
-        let result = client.try_queue(&attacker, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        let result = client.try_queue(&attacker, &desc, &target, &3600, &deps);
         assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
     }
 
@@ -523,7 +563,8 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        client.queue(&admin, &desc, &target, &3600);
+        let deps = soroban_sdk::Vec::new(&env);
+        client.queue(&admin, &desc, &target, &3600, &deps);
         let cancelled = client.cancel_all(&admin);
         assert_eq!(cancelled, 1);
         let op = client.get_op(&0).unwrap();
@@ -535,10 +576,11 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
+        let deps = soroban_sdk::Vec::new(&env);
 
-        client.queue(&admin, &desc, &target, &3600);
-        client.queue(&admin, &desc, &target, &3600);
-        client.queue(&admin, &desc, &target, &3600);
+        client.queue(&admin, &desc, &target, &3600, &deps);
+        client.queue(&admin, &desc, &target, &3600, &deps);
+        client.queue(&admin, &desc, &target, &3600, &deps);
 
         // Mark one as executed
         env.ledger().with_mut(|l| l.timestamp += 3601);
@@ -612,8 +654,9 @@ mod tests {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
+        let deps = soroban_sdk::Vec::new(&env);
         // Queue with current min_delay of 3600
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         // Raise min_delay to 7200 — op was already queued with delay=3600
         client.set_min_delay(&admin, &7200);
         // Advance past the original ETA
@@ -638,6 +681,100 @@ mod tests {
     }
 
     #[test]
+    fn test_operation_with_dependencies() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = soroban_sdk::Vec::new(&env);
+
+        // Queue op0 with no dependencies
+        let op0 = client.queue(&admin, &desc, &target, &3600, &deps);
+
+        // Queue op1 that depends on op0
+        let mut deps_for_op1 = soroban_sdk::Vec::new(&env);
+        deps_for_op1.push_back(op0);
+        let op1 = client.queue(&admin, &desc, &target, &3600, &deps_for_op1);
+
+        // Try to execute op1 before op0 — should fail
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        let result = client.try_execute(&admin, &op1);
+        assert_eq!(result, Err(Ok(TimelockError::DependencyNotMet)));
+
+        // Execute op0 first
+        assert!(client.try_execute(&admin, &op0).is_ok());
+
+        // Now op1 should execute
+        assert!(client.try_execute(&admin, &op1).is_ok());
+    }
+
+    #[test]
+    fn test_cancelled_operation_clears_dependencies() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = soroban_sdk::Vec::new(&env);
+
+        let op0 = client.queue(&admin, &desc, &target, &3600, &deps);
+
+        let mut deps_for_op1 = soroban_sdk::Vec::new(&env);
+        deps_for_op1.push_back(op0);
+        let op1 = client.queue(&admin, &desc, &target, &3600, &deps_for_op1);
+
+        // Cancel op1 — dependencies should be cleared
+        client.cancel(&admin, &op1);
+
+        // op0 can still be cancelled independently
+        assert!(client.try_cancel(&admin, &op0).is_ok());
+    }
+
+    #[test]
+    fn test_requeued_operation_has_fresh_eta() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle to v2");
+        let deps = soroban_sdk::Vec::new(&env);
+
+        // Queue operation with delay 86400
+        let op_id_1 = client.queue(&admin, &desc, &target, &86400, &deps);
+        let op_1 = client.get_op(&op_id_1).unwrap();
+        let eta_1 = op_1.eta;
+
+        // Cancel it immediately
+        client.cancel(&admin, &op_id_1);
+
+        // Advance time by 1 second
+        env.ledger().with_mut(|l| l.timestamp += 1);
+
+        // Re-queue with identical description and target
+        let op_id_2 = client.queue(&admin, &desc, &target, &86400, &deps);
+        let op_2 = client.get_op(&op_id_2).unwrap();
+        let eta_2 = op_2.eta;
+
+        // New operation should have a different ID
+        assert_ne!(op_id_1, op_id_2);
+
+        // New operation should have a fresh ETA (1 second later)
+        assert_eq!(eta_2, eta_1 + 1);
+
+        // Verify old operation is still cancelled
+        let old_op = client.get_op(&op_id_1).unwrap();
+        assert!(old_op.cancelled);
+
+        // Verify new operation is not cancelled
+        assert!(!op_2.cancelled);
+
+        // Try to execute old operation — should fail
+        env.ledger().with_mut(|l| l.timestamp += 86400);
+        let result = client.try_execute(&admin, &op_id_1);
+        assert_eq!(result, Err(Ok(TimelockError::AlreadyCancelled)));
+
+        // New operation should still be too early (needs 86400 from its own queue time)
+        let result = client.try_execute(&admin, &op_id_2);
+        assert_eq!(result, Err(Ok(TimelockError::TooEarly)));
+
+        // Advance to new operation's ETA
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        assert!(client.try_execute(&admin, &op_id_2).is_ok());
     fn test_queue_emits_op_queued_event() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
