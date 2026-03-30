@@ -626,24 +626,26 @@ impl RouterMiddleware {
     /// # Errors
     /// * [`MiddlewareError::Unauthorized`] — if `current` is not the admin.
     /// * [`MiddlewareError::NotInitialized`] — if the contract has not been initialized.
-    pub fn transfer_admin(
-        env: Env,
-        current: Address,
-        new_admin: Address,
-    ) -> Result<(), MiddlewareError> {
-        current.require_auth();
-        Self::require_admin(&env, &current)?;
+    pub fn transfer_admin(env: Env, current: Address, new_admin: Address) -> Result<(), MiddlewareError> {
+    current.require_auth();
 
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    // One-liner using the shared macro
+    router_common::require_admin_simple!(
+        &env,
+        &current,
+        &DataKey::Admin,
+        MiddlewareError
+    )?;
 
-        // ← FIXED: Emit event to match other contracts (router-access, router-core, etc.)
-        env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
-            (current.clone(), new_admin.clone()),
-        );
+    env.storage().instance().set(&DataKey::Admin, &new_admin);
 
-        Ok(())
-    }
+    env.events().publish(
+        (Symbol::new(&env, "admin_transferred"),),
+        (current, new_admin),
+    );
+
+    Ok(())
+}
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
