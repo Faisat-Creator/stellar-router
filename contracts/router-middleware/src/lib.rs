@@ -498,6 +498,25 @@ impl RouterMiddleware {
             .get(&DataKey::CallLog(route))
             .unwrap_or(Vec::new(&env))
     }
+
+    /// Returns the number of call log entries stored for a route.
+    ///
+    /// More efficient than get_call_log(route).len() as it avoids loading all entries.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `route` - The route name to get the log length for.
+    ///
+    /// # Returns
+    /// The number of call log entries as `u32`.
+    pub fn get_call_log_length(env: Env, route: String) -> u32 {
+        env.storage()
+            .instance()
+            .get::<DataKey, Vec<CallLogEntry>>(&DataKey::CallLog(route))
+            .map(|log| log.len())
+            .unwrap_or(0)
+    }
+
     /// Get rate limit state for a caller on a specific route.
     ///
     /// Returns the current [`RateLimitState`] for `caller` on `route`, which includes the
@@ -1078,5 +1097,48 @@ mod tests {
         client.reset_circuit_breaker(&admin, &route);
         let state = client.circuit_breaker_state(&route).unwrap();
         assert!(!state.is_open);
+    }
+
+    // ── Issue #187: get_call_log_length ─────────────────────────────────────────
+
+    #[test]
+    fn test_get_call_log_length_zero_before_calls() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        assert_eq!(client.get_call_log_length(&route), 0);
+    }
+
+    #[test]
+    fn test_get_call_log_length_matches_get_call_log() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        let caller = Address::generate(&env);
+        for _ in 0..5 {
+            client.pre_call(&caller, &route);
+            client.post_call(&caller, &route, &true);
+        }
+
+        let len = client.get_call_log_length(&route);
+        let full_log = client.get_call_log(&route);
+        assert_eq!(len, full_log.len());
+    }
+
+    #[test]
+    fn test_get_call_log_length_respects_retention() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &3);
+
+        let caller = Address::generate(&env);
+        for _ in 0..10 {
+            client.pre_call(&caller, &route);
+            client.post_call(&caller, &route, &true);
+        }
+
+        assert_eq!(client.get_call_log_length(&route), 3);
     }
 }
