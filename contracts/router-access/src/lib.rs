@@ -86,13 +86,15 @@ impl RouterAccess {
         caller.require_auth();
         Self::require_role_manager(&env, &caller, &role)?;
 
-        if !Self::has_role_internal(&env, &role, &target) {
+        // Check the raw storage key — not has_role_internal — so that expired
+        // roles (where has_role_internal returns false) can still be revoked
+        // to clean up storage.
+        let key = DataKey::HasRole(role.clone(), target.clone());
+        if !env.storage().instance().has(&key) {
             return Err(AccessError::RoleNotFound);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::HasRole(role, target), &false);
+        env.storage().instance().remove(&key);
         Ok(())
     }
 
@@ -306,5 +308,33 @@ mod tests {
         let new_admin = Address::generate(&env);
         client.transfer_super_admin(&admin, &new_admin);
         assert_eq!(client.super_admin(), new_admin);
+    }
+
+    #[test]
+    fn test_revoke_role_removes_storage_key() {
+        // Verifies revoke_role removes the HasRole key rather than setting it to false,
+        // so a subsequent grant_role on the same (role, target) pair succeeds.
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        client.grant_role(&admin, &role, &user);
+        assert!(client.has_role(&role, &user));
+        client.revoke_role(&admin, &role, &user);
+        assert!(!client.has_role(&role, &user));
+        // Re-granting must succeed — if the key was set to false instead of removed,
+        // has_role_internal would return false but the key would still exist,
+        // and a future implementation checking .has() would wrongly block the grant.
+        assert!(client.try_grant_role(&admin, &role, &user).is_ok());
+        assert!(client.has_role(&role, &user));
+    }
+
+    #[test]
+    fn test_revoke_nonexistent_role_fails() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        // Never granted — should return RoleNotFound
+        let result = client.try_revoke_role(&admin, &role, &user);
+        assert_eq!(result, Err(Ok(AccessError::RoleNotFound)));
     }
 }
